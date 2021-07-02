@@ -1,0 +1,451 @@
+import sys
+import warnings
+warnings.filterwarnings('ignore')
+from tqdm import tqdm
+import pandas as pd
+import numpy as np
+from plotly.offline import download_plotlyjs, init_notebook_mode, plot, iplot
+from plotly import graph_objs as go
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import TimeSeriesSplit
+from scipy.optimize import minimize
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from datetime import datetime
+import timestring
+import dateutil.parser as parser
+import matplotlib as mpl
+from statsmodels.tsa.ar_model import AutoReg
+from sklearn.metrics import mean_squared_error
+from math import sqrt
+from numpy import array
+from keras.models import Sequential
+from keras.layers import LSTM
+from keras.layers import Dense
+import math
+from sklearn.preprocessing import MinMaxScaler
+
+
+df = pd.read_csv('C:\\...\\USDRUB.csv')
+df.set_axis(['ticker', 'per', 'date', 'time', 'price'], axis = 'columns', inplace = True)
+df.drop(['ticker', 'per', 'time'],  axis=1, inplace=True)
+
+
+for i in range(len(df.date)):
+    df.date[i] = parser.parse(df.date[i], dayfirst=True)
+
+#==================================================================
+#------------------------------------------------------------------
+# ERRORS
+EPSILON = 0.0000000001
+
+def _error(actual: np.ndarray, predicted: np.ndarray):
+    return actual - predicted
+
+
+def _percentage_error(actual: np.ndarray, predicted: np.ndarray):
+    return _error(actual, predicted) / (actual + EPSILON)
+
+def rmse_er(actual, predicted):
+    return np.sqrt(mean_squared_error(actual, predicted))
+
+
+def mae_er(actual: np.ndarray, predicted: np.ndarray):
+    return np.mean(np.abs(_error(actual, predicted)))
+
+
+def mdae_er(actual: np.ndarray, predicted: np.ndarray):
+    return np.median(np.abs(_error(actual, predicted)))
+
+
+def mpe_er(actual: np.ndarray, predicted: np.ndarray):
+    return np.mean(_percentage_error(actual, predicted))
+
+
+def mape_er(actual: np.ndarray, predicted: np.ndarray):
+
+    return np.mean(np.abs(_percentage_error(actual, predicted)))
+
+###########################################################
+
+
+# split dataset
+x = []
+for i in range(len(df)):
+	x.append(df.price[i])
+X = x
+train, test = X[1:len(X)-127], X[len(X)-127:]
+# train autoregression
+window = 29
+model = AutoReg(train, lags=29)
+model_fit = model.fit()
+coef = model_fit.params
+# walk forward over time steps in test
+history = train[len(train)-window:]
+history = [history[i] for i in range(len(history))]
+ar_predictions = list()
+for t in range(len(test)):
+	length = len(history)
+	lag = [history[i] for i in range(length-window,length)]
+	yhat = coef[0]
+	for d in range(window):
+		yhat += coef[d+1] * lag[window-d-1]
+	obs = test[t]
+	ar_predictions.append(yhat)
+	history.append(obs)
+#	print('predicted=%f, expected=%f' % (yhat, obs))
+
+rmse = sqrt(mean_squared_error(test, ar_predictions))
+print('Test RMSE: %.3f' % rmse)
+# plot
+plt.plot(test, label ='Реальные данные')
+plt.plot(ar_predictions, color='red', label = 'Прогноз')
+plt.title('Авторегрессионная модель',  fontweight = 'heavy', size = 30 )
+plt.grid(True)
+plt.axis('tight')
+plt.legend(loc="best", fontsize=25)
+plt.show()
+
+ostatki_validacii_ar = []
+for i in range(126):
+    ostatki_validacii_ar.append(ar_predictions[i] - df.price[1000 + i])
+
+sum23=0
+for i in range(len(ostatki_validacii_ar)):
+    sum23+= ostatki_validacii_ar[i]
+print(sum23)
+s_ar = abs((sum23 / (len(ostatki_validacii_ar)-1)))**(1/2)
+print(s_ar)
+
+
+rmse_ar = rmse_er(np.array(test), np.array(ar_predictions))
+mae_ar = mae_er(np.array(test), np.array(ar_predictions))
+mdae_ar = mdae_er(np.array(test), np.array(ar_predictions))
+mpe_ar = mpe_er(np.array(test), np.array(ar_predictions))
+mape_ar = mape_er(np.array(test), np.array(ar_predictions))
+
+print(rmse_ar, 'rmse авторегрессии')
+print(mae_ar,'mae авторегрессии')
+print(mdae_ar, 'mdae авторегрессии')
+print(mpe_ar, 'mpe авторегрессии')
+print(mape_ar, "mape авторегрессии")
+
+print(len(test), 'test')
+#=========================
+class HoltWinters:
+
+    """
+    Модель Хольта-Винтерса с методом Брутлага для детектирования аномалий
+
+
+    # series - исходный временной ряд
+    # slen - длина сезона
+    # alpha, beta, gamma - коэффициенты модели Хольта-Винтерса
+    # n_preds - горизонт предсказаний
+    # scaling_factor - задаёт ширину доверительного интервала по Брутлагу (обычно принимает значения от 2 до 3)
+
+    """
+
+    def __init__(self, series, slen, alpha, beta, gamma, n_preds, scaling_factor=1.96):
+        self.series = series
+        self.slen = slen
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.n_preds = n_preds
+        self.scaling_factor = scaling_factor
+
+    def initial_trend(self):
+        sum = 0.0
+        for i in range(self.slen):
+            sum += float(self.series[i+self.slen] - self.series[i]) / self.slen
+        return sum / self.slen  
+
+    def initial_seasonal_components(self):
+        seasonals = {}
+        season_averages = []
+        n_seasons = int(len(self.series)/self.slen)
+        # вычисляем сезонные средние
+        for j in range(n_seasons):
+            season_averages.append(sum(self.series[self.slen*j:self.slen*j+self.slen])/float(self.slen))
+        # вычисляем начальные значения
+        for i in range(self.slen):
+            sum_of_vals_over_avg = 0.0
+            for j in range(n_seasons):
+                sum_of_vals_over_avg += self.series[self.slen*j+i]-season_averages[j]
+            seasonals[i] = sum_of_vals_over_avg/n_seasons
+        return seasonals   
+
+    def triple_exponential_smoothing(self):
+        self.result = []
+        self.Smooth = []
+        self.Season = []
+        self.Trend = []
+        self.PredictedDeviation = []
+        self.UpperBond = []
+        self.LowerBond = []
+
+        seasonals = self.initial_seasonal_components()
+
+        for i in range(len(self.series)+self.n_preds):
+            if i == 0: # инициализируем значения компонент
+                smooth = self.series[0]
+                trend = self.initial_trend()
+                self.result.append(self.series[0])
+                self.Smooth.append(smooth)
+                self.Trend.append(trend)
+                self.Season.append(seasonals[i%self.slen])
+
+                self.PredictedDeviation.append(0)
+
+                self.UpperBond.append(self.result[0] + 
+                                      self.scaling_factor * 
+                                      self.PredictedDeviation[0])
+
+                self.LowerBond.append(self.result[0] - 
+                                      self.scaling_factor * 
+                                      self.PredictedDeviation[0])
+
+                continue
+            if i >= len(self.series): # прогнозируем
+                m = i - len(self.series) + 1
+                self.result.append((smooth + m*trend) + seasonals[i%self.slen])
+
+                # во время прогноза с каждым шагом увеличиваем неопределенность
+                self.PredictedDeviation.append(self.PredictedDeviation[-1]*1.01) 
+
+            else:
+                val = self.series[i]
+                last_smooth, smooth = smooth, self.alpha*(val-seasonals[i%self.slen]) + (1-self.alpha)*(smooth+trend)
+                trend = self.beta * (smooth-last_smooth) + (1-self.beta)*trend
+                seasonals[i%self.slen] = self.gamma*(val-smooth) + (1-self.gamma)*seasonals[i%self.slen]
+                self.result.append(smooth+trend+seasonals[i%self.slen])
+
+                # Отклонение рассчитывается в соответствии с алгоритмом Брутлага
+                self.PredictedDeviation.append(self.gamma * np.abs(self.series[i] - self.result[i]) 
+                                               + (1-self.gamma)*self.PredictedDeviation[-1])
+
+            self.UpperBond.append(self.result[-1] + 
+                                  self.scaling_factor * 
+                                  self.PredictedDeviation[-1])
+
+            self.LowerBond.append(self.result[-1] - 
+                                  self.scaling_factor * 
+                                  self.PredictedDeviation[-1])
+
+            self.Smooth.append(smooth)
+            self.Trend.append(trend)
+            self.Season.append(seasonals[i % self.slen])
+
+
+
+def timeseriesCVscore(x):
+    # вектор ошибок
+    errors = []
+
+    values = data.values
+    alpha, beta, gamma = x
+
+    # задаём число фолдов для кросс-валидации
+    tscv = TimeSeriesSplit(n_splits=2) 
+
+    # идем по фолдам, на каждом обучаем модель, строим прогноз на отложенной выборке и считаем ошибку
+    for train, test in tscv.split(values):
+
+        model_holta = HoltWinters(series=values[train], slen = 24*7, alpha=alpha, beta=beta, gamma=gamma, n_preds=len(test-1))
+        model_holta.triple_exponential_smoothing()
+
+        predictions = model_holta.result[-len(test):]
+        actual = values[test]
+        error = mean_squared_error(predictions, actual)
+        errors.append(error)
+
+    # Возвращаем средний квадрат ошибки по вектору ошибок 
+    return np.mean(np.array(errors))
+
+
+
+data = df.price[:-120] # отложим часть данных для тестирования
+# инициализируем значения параметров
+x = [0, 0, 0] 
+# Минимизируем функцию потерь с ограничениями на параметры
+opt = minimize(timeseriesCVscore, x0=x, method="Powell", bounds = ((0, 1), (0, 1), (0, 1)))
+
+# Из оптимизатора берем оптимальное значение параметров
+alpha_final, beta_final, gamma_final = opt.x
+print(alpha_final, beta_final, gamma_final)
+
+
+# Передаем оптимальные значения модели, 
+data = df.price
+model_holta = HoltWinters(data[:-127], slen = 24*7, alpha = alpha_final, beta = beta_final, gamma = gamma_final, n_preds = 127, scaling_factor = 2.56)
+model_holta.triple_exponential_smoothing()
+
+
+
+plt.figure(figsize=(25, 10))
+plt.title('Модель Хольта-Уинтерса', fontweight = 'heavy', size = 30 )
+plt.plot(model_holta.result, 'b-.', label = "Модель")
+plt.plot(data.values,  'g--',  label = "Реальные значения")
+plt.axvspan(len(data)-128, len(data), alpha=0.5, color='lightgrey')
+plt.grid(True)
+plt.axis('tight')
+plt.legend(loc="best", fontsize=25)
+plt.show()
+
+
+ostatki_validacii_holta, holt_grafik  = [], []
+for i in range(1000, 1126):
+    ostatki_validacii_holta.append(model_holta.result[i] - data.values[i])
+    holt_grafik.append(model_holta.result[i])
+
+sum=0
+for i in range(len(ostatki_validacii_holta)):
+    sum+= ostatki_validacii_holta[i]
+print(sum)
+s_holta = abs((sum / (len(ostatki_validacii_holta)-1)))**(1/2)
+print(s_holta)
+
+
+rmse_h = rmse_er(np.array(data.values[1001:]), np.array(model_holta.result[1001:]))
+mae_h = mae_er(np.array(data.values[1001:]), np.array(model_holta.result[1001:]))
+mdae_h = mdae_er(np.array(data.values[1001:]), np.array(model_holta.result[1001:]))
+mpe_h = mpe_er(np.array(data.values[1001:]), np.array(model_holta.result[1001:]))
+mape_h = mape_er(np.array(data.values[1001:]), np.array(model_holta.result[1001:]))
+
+print(rmse_h, 'rmse Хольта-Винтерса')
+print(mae_h,'mae Хольта-Винтерса')
+print(mdae_h, 'mdae Хольта-Винтерса')
+print(mpe_h, 'mpe Хольта-Винтерса')
+print(mape_h, "mape Хольта-Винтерса")
+#========================================================================
+#-------------------------------------
+#=========================================================================
+# convert an array of values into a dataset matrix
+def create_dataset(dataset, look_back=1):
+	dataX, dataY = [], []
+	for i in range(len(dataset)-look_back-1):
+		a = dataset[i:(i+look_back), 0]
+		dataX.append(a)
+		dataY.append(dataset[i + look_back, 0])
+	return numpy.array(dataX), numpy.array(dataY)
+
+#----------------------------------------------------------------------------------------
+df = pd.read_csv('C:\\...\\USDRUB.csv')
+df.set_axis(['ticker', 'per', 'date', 'time', 'price'], axis = 'columns', inplace = True)
+df.drop(['ticker', 'per', 'time'],  axis=1, inplace=True)
+
+
+y = []
+for i in range(len(df.price)):
+    y.append([df.price[i]])
+y = np.asarray(y)
+
+#==================================================================================================================
+dataset = y
+dataset = dataset.astype('float32')
+print(len(y))
+
+# normalize the dataset
+scaler = MinMaxScaler(feature_range=(0, 1))
+dataset = scaler.fit_transform(dataset)
+# split into train and test sets
+train_size = int(len(dataset) * 0.89)
+test_size = len(dataset) - train_size
+train, test = dataset[0:(train_size-3),:], dataset[(train_size-3):len(dataset),:]
+
+print(len(train), len(test))
+# reshape into X=t and Y=t+1
+look_back = 1
+trainX, Y_train = create_dataset(train, look_back)
+testX, Y_test = create_dataset(test, look_back)
+# reshape input to be [samples, time steps, features]
+trainX = numpy.reshape(trainX, (trainX.shape[0], 1, trainX.shape[1]))
+testX = numpy.reshape(testX, (testX.shape[0], 1, testX.shape[1]))
+# create and fit the LSTM network
+model = Sequential()
+model.add(LSTM(4, input_shape=(1, look_back)))
+model.add(Dense(1))
+model.compile(loss='mean_squared_error', optimizer='adam')
+model.fit(trainX, Y_train, epochs=10, batch_size=1, verbose=2)
+educ_train = model.predict(trainX)
+data_for_test = model.predict(testX)
+educ_train = scaler.inverse_transform(educ_train)
+Y_train = scaler.inverse_transform([Y_train])
+data_for_test = scaler.inverse_transform(data_for_test)
+Y_test = scaler.inverse_transform([Y_test])
+# calculate root mean squared error
+trainScore = math.sqrt(mean_squared_error(Y_train[0], educ_train[:,0]))
+print('Train Score: %.2f RMSE' % (trainScore))
+testScore = math.sqrt(mean_squared_error(Y_test[0], data_for_test[:,0]))
+print('Test Score: %.2f RMSE' % (testScore))
+
+def mean_absolute_percentage_error(y_true, y_pred): 
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+print('mape')
+print(mean_absolute_percentage_error(Y_test[0], data_for_test[:,0]))
+
+from sklearn.metrics import mean_absolute_error
+print('mae', mean_absolute_error(Y_test[0], data_for_test[:,0]))
+trainPredictPlot = numpy.empty_like(dataset)
+trainPredictPlot[:, :] = numpy.nan
+trainPredictPlot[look_back:len(educ_train)+look_back, :] = educ_train
+testPredictPlot = numpy.empty_like(dataset)
+testPredictPlot[:, :] = numpy.nan
+testPredictPlot[len(educ_train)+(look_back*2)+1:len(dataset)-1, :] = data_for_test
+plt.plot(scaler.inverse_transform(dataset), label = 'Реальные значения')
+plt.title('Модель долгосрочной кратковременной памяти', fontweight = 'heavy', size = 30 )
+plt.plot(trainPredictPlot, label = 'Модель при обучении')
+plt.plot(testPredictPlot, label = 'Модель при валидации')
+plt.legend(loc="best", fontsize=25)
+plt.grid()
+plt.show()
+
+
+
+ostatki_validacii_lstm, lstm_grafik = [], []
+for i in range(1001, 1127):
+    ostatki_validacii_lstm.append(testPredictPlot[i][0] - data.values[i-1])
+    lstm_grafik.append(testPredictPlot[i][0])
+
+
+sum=0
+for i in range(len(ostatki_validacii_lstm)):
+    sum+= ostatki_validacii_lstm[i]
+s_lstm = abs((sum / (len(ostatki_validacii_lstm)-1)))**(1/2)
+
+
+
+
+#############################################################################
+sum = 0
+sum = 1/s_lstm + 1/s_holta + 1/s_ar
+k_lstm_1 = (1/s_lstm)/sum
+k_holta = (1/s_holta)/sum
+k_ar = (1/s_ar)/sum
+print('Коэффициент доверия дкп2:', k_lstm)
+print('Коэффициент доверия Хольта:', k_holta)
+print('Коэффициент доверия АР:', k_ar)
+print('проверка', k_lstm_1 + k_holta + k_ar)
+
+ansamble_model_4 = []
+for i in range(0, 126 ):
+    ansamble_model_4.append(k_lstm * lstm_grafik[i] + k_holta * model_holta.result[1000 + i] + k_ar * ar_predictions[i])
+
+#---------------------------------------------------------------------------------
+plt.figure(figsize=(25, 10))
+plt.plot(lstm_grafik, 'b-.', label = "Модель долгосрочной короткой памяти")
+plt.plot(data.values[1000:1126],  'g',  label = "Реальные значения")
+plt.plot(model_holta.result[1000:], 'y--',  label = 'Модель Хольта')
+plt.plot(ansamble_model_4, 'r--', label = 'Сверточная модель')
+plt.plot(ar_predictions[:126], 'b-.',  label = 'Авторегрессионная модель')
+plt.grid(True)
+plt.axis('tight')
+plt.legend(loc="best", fontsize=26)
+plt.show()
+
+
+trainScore = math.sqrt(mean_squared_error(data.values[1000:1126], ansamble_model_2))
+print('Train Score2: %.2f RMSE' % (trainScore))
+print(len(testPredictPlot), 'len')
